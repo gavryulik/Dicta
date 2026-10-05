@@ -15,6 +15,12 @@ were using.
 
 ![Dicta menu bar interface](assets/dicta-menubar.png)
 
+## Demo
+
+Hold **Option+Space**, speak in Russian, then release. Dicta translates your speech locally and inserts the English text into the active text field.
+
+![Dicta demo](assets/dicta-demo.gif)
+
 ## What is Dicta?
 
 Dicta is designed for people who prefer speaking Russian but need to write in
