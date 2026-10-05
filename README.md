@@ -87,6 +87,13 @@ Use macOS's per-app approval workflow:
 Only approve a copy obtained from this repository's official Releases section.
 There is no need to disable Gatekeeper or change macOS security globally.
 
+### First startup
+
+The first launch of Dicta may take longer than usual while the local Whisper model is initialized. Please allow some time for Dicta to appear in the menu bar and become ready.
+
+Subsequent launches are typically faster.
+
+
 ## Permissions
 
 Dicta needs three macOS permissions:
