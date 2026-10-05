@@ -1,0 +1,57 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local secrets and environment configuration
+.env
+.env.*
+!.env.example
+
+# Additional coverage output
+.coverage.*
+coverage.xml
+
+# macOS application packaging
+/build/
+/dist/
+
+# Local whisper.cpp checkout, models, and build artifacts
+/vendor/whisper.cpp/
+ggml-*.bin
+*.part
+
+# Generated and temporary audio
+*.wav
+*.m4a
+*.mp3
+*.flac
+*.ogg
+*.raw
+/tmp/
+/recordings/
+
+# Local release archives
+/Dicta.zip
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Internal agent instructions
+/AGENTS.md
+
+# macOS
+.DS_Store
+
+# macOS metadata
+.DS_Store
