@@ -1,31 +1,36 @@
-"""Text insertion into the macOS field focused when dictation started."""
+"""Capture an application context and paste into its current cursor position."""
 
 from dataclasses import dataclass
+import os
 import time
 
-from voice_translator.config import (
-    APP_ACTIVATION_DELAY_SECONDS,
-    PASTE_COMPLETION_DELAY_SECONDS,
-    PRODUCT_NAME,
-)
+from voice_translator.config import PASTE_COMPLETION_DELAY_SECONDS, PRODUCT_NAME
 
 # Hardware key codes from the macOS ANSI keyboard layout. CoreGraphics uses
-# these physical positions without translating the character through the
-# currently selected input source.
+# these physical positions without translating through the current input source.
 MAC_KEY_CODE_V = 9
 MAC_KEY_CODE_LEFT_COMMAND = 55
 
 
 class TextInsertionError(RuntimeError):
-    """Raised when translated text cannot be inserted."""
+    """Raised when a target cannot be captured or text cannot be inserted safely."""
+
+
+class _TransientTargetCaptureError(TextInsertionError):
+    """Raised when the frontmost application changes during capture."""
 
 
 @dataclass(frozen=True)
-class TargetApplication:
+class TargetContext:
     process_id: int
     name: str
-    focused_element: object
-    element_description: str = "Unknown Accessibility element"
+    window_element: object | None = None
+
+
+@dataclass(frozen=True)
+class _ContextSnapshot:
+    process_id: int
+    window_element: object | None
 
 
 @dataclass(frozen=True)
@@ -33,10 +38,10 @@ class PasteboardItemSnapshot:
     values: tuple[tuple[str, bytes], ...]
 
 
-def capture_target_application() -> TargetApplication:
-    """Capture the system-wide app and element with keyboard focus."""
+def capture_target_context() -> TargetContext:
+    """Capture the frontmost application and an optional reliable AX window."""
     try:
-        from AppKit import NSRunningApplication
+        from AppKit import NSRunningApplication, NSWorkspace
         from CoreFoundation import CFEqual
         import ApplicationServices as accessibility
     except ImportError as error:
@@ -44,114 +49,201 @@ def capture_target_application() -> TargetApplication:
             "The PyObjC Cocoa package is not installed."
         ) from error
 
-    return _capture_accessibility_target(
-        accessibility, NSRunningApplication, CFEqual
+    return _capture_target_context(
+        accessibility,
+        NSRunningApplication,
+        CFEqual,
+        workspace=NSWorkspace.sharedWorkspace(),
+        current_process_id=os.getpid(),
     )
 
 
-def _capture_accessibility_target(
-    accessibility, running_application_class, elements_equal=lambda a, b: a == b
-) -> TargetApplication:
-    """Capture one consistent snapshot from the system Accessibility tree."""
-    system_wide = accessibility.AXUIElementCreateSystemWide()
-    application_element = _required_ax_attribute(
-        accessibility,
-        system_wide,
-        accessibility.kAXFocusedApplicationAttribute,
-        "the focused application",
-    )
-    focused_element = _required_ax_attribute(
-        accessibility,
-        application_element,
-        accessibility.kAXFocusedUIElementAttribute,
-        "the focused editable element",
+def _capture_target_context(
+    accessibility,
+    running_application_class,
+    elements_equal=lambda first, second: first == second,
+    *,
+    workspace,
+    current_process_id: int | None = None,
+    retry_delays: tuple[float, ...] = (0.0, 0.025, 0.050, 0.100, 0.175),
+    sleeper=time.sleep,
+) -> TargetContext:
+    """Capture two coherent application/window snapshots with bounded retries."""
+    last_error = None
+    for attempt_number, delay in enumerate(retry_delays, start=1):
+        if delay:
+            sleeper(delay)
+        try:
+            first = _capture_context_snapshot(
+                accessibility, workspace, current_process_id
+            )
+            second = _capture_context_snapshot(
+                accessibility, workspace, current_process_id
+            )
+            if first.process_id != second.process_id:
+                raise _TransientTargetCaptureError(
+                    "The frontmost application changed while dictation was starting."
+                )
+            if (
+                first.window_element is not None
+                and second.window_element is not None
+                and not elements_equal(first.window_element, second.window_element)
+            ):
+                raise _TransientTargetCaptureError(
+                    "The active application window changed while dictation was starting."
+                )
+
+            window_element = None
+            if (
+                first.window_element is not None
+                and second.window_element is not None
+            ):
+                window_element = first.window_element
+            elif (
+                first.window_element is not None
+                or second.window_element is not None
+            ):
+                print(
+                    "Target capture: AX window identity was inconsistent; "
+                    "continuing with application-level verification.",
+                    flush=True,
+                )
+
+            application = (
+                running_application_class.runningApplicationWithProcessIdentifier_(
+                    first.process_id
+                )
+            )
+            if application is None:
+                raise _TransientTargetCaptureError(
+                    "The frontmost application is no longer running."
+                )
+            return TargetContext(
+                process_id=first.process_id,
+                name=str(application.localizedName() or "Unknown application"),
+                window_element=window_element,
+            )
+        except _TransientTargetCaptureError as error:
+            last_error = error
+            print(
+                f"Target capture attempt {attempt_number}/{len(retry_delays)} "
+                f"failed (transient): {error}",
+                flush=True,
+            )
+
+    elapsed_ms = int(sum(retry_delays) * 1000)
+    raise TextInsertionError(
+        "Could not capture a stable frontmost application "
+        f"after {len(retry_delays)} attempts over {elapsed_ms} ms. "
+        f"Last failure: {last_error}"
     )
 
-    # Accessibility calls are separate operations. Confirm that neither focus
-    # value changed between them rather than saving a mixed app/field pair.
-    confirmed_application = _required_ax_attribute(
-        accessibility,
-        system_wide,
-        accessibility.kAXFocusedApplicationAttribute,
-        "the focused application",
-    )
-    confirmed_element = _required_ax_attribute(
-        accessibility,
-        confirmed_application,
-        accessibility.kAXFocusedUIElementAttribute,
-        "the focused editable element",
-    )
-    if not elements_equal(application_element, confirmed_application) or not elements_equal(
-        focused_element, confirmed_element
-    ):
-        raise TextInsertionError(
-            "Keyboard focus changed while dictation was starting. Please try again."
+
+def _capture_context_snapshot(
+    accessibility, workspace, current_process_id
+) -> _ContextSnapshot:
+    workspace_application = workspace.frontmostApplication()
+    if workspace_application is None:
+        raise _TransientTargetCaptureError(
+            "NSWorkspace returned no frontmost application."
         )
+    process_id = int(workspace_application.processIdentifier())
+    _reject_self_target(process_id, current_process_id)
 
-    error_code, process_id = accessibility.AXUIElementGetPid(
+    _verify_optional_systemwide_pid(accessibility, process_id)
+    window_element = _optional_focused_window(accessibility, process_id)
+    return _ContextSnapshot(process_id, window_element)
+
+
+def _verify_optional_systemwide_pid(accessibility, expected_process_id):
+    """Use system-wide AX focus only as a consistency signal when available."""
+    system_wide = accessibility.AXUIElementCreateSystemWide()
+    error_code, application_element = accessibility.AXUIElementCopyAttributeValue(
+        system_wide, accessibility.kAXFocusedApplicationAttribute, None
+    )
+    if error_code == accessibility.kAXErrorAPIDisabled:
+        raise TextInsertionError(
+            f"Accessibility permission is disabled for {PRODUCT_NAME}."
+        )
+    if error_code != accessibility.kAXErrorSuccess or application_element is None:
+        return
+
+    pid_error, ax_process_id = accessibility.AXUIElementGetPid(
         application_element, None
     )
-    if error_code != accessibility.kAXErrorSuccess:
+    if pid_error != accessibility.kAXErrorSuccess or ax_process_id is None:
+        return
+    if int(ax_process_id) != expected_process_id:
+        raise _TransientTargetCaptureError(
+            "NSWorkspace and Accessibility disagree about the frontmost application "
+            f"(PIDs {expected_process_id} and {int(ax_process_id)})."
+        )
+
+
+def _optional_focused_window(accessibility, process_id):
+    """Return a verified focused AX window, or None when no reliable one exists."""
+    try:
+        application_element = accessibility.AXUIElementCreateApplication(process_id)
+    except Exception:
+        return None
+    if application_element is None:
+        return None
+
+    pid_error, application_process_id = accessibility.AXUIElementGetPid(
+        application_element, None
+    )
+    if (
+        pid_error == accessibility.kAXErrorSuccess
+        and application_process_id is not None
+        and int(application_process_id) != process_id
+    ):
+        raise _TransientTargetCaptureError(
+            "The AX application PID does not match the frontmost application."
+        )
+
+    focused_window_attribute = getattr(
+        accessibility, "kAXFocusedWindowAttribute", "AXFocusedWindow"
+    )
+    error_code, window_element = accessibility.AXUIElementCopyAttributeValue(
+        application_element, focused_window_attribute, None
+    )
+    if error_code == accessibility.kAXErrorAPIDisabled:
         raise TextInsertionError(
-            "Could not determine the focused application's process ID."
+            f"Accessibility permission is disabled for {PRODUCT_NAME}."
+        )
+    if error_code != accessibility.kAXErrorSuccess or window_element is None:
+        return None
+
+    pid_error, window_process_id = accessibility.AXUIElementGetPid(
+        window_element, None
+    )
+    if (
+        pid_error != accessibility.kAXErrorSuccess
+        or window_process_id is None
+        or int(window_process_id) != process_id
+    ):
+        return None
+    return window_element
+
+
+def _reject_self_target(process_id, current_process_id):
+    if current_process_id is not None and process_id == current_process_id:
+        raise TextInsertionError(
+            f"{PRODUCT_NAME} cannot use itself as the dictation target."
         )
 
-    application = running_application_class.runningApplicationWithProcessIdentifier_(
-        process_id
-    )
-    if application is None:
-        raise TextInsertionError("The focused application is no longer running.")
 
-    return TargetApplication(
-        process_id=int(process_id),
-        name=str(application.localizedName() or "Unknown application"),
-        focused_element=focused_element,
-        element_description=_describe_ax_element(accessibility, focused_element),
-    )
-
-
-def _required_ax_attribute(accessibility, element, attribute, description):
-    error_code, value = accessibility.AXUIElementCopyAttributeValue(
-        element, attribute, None
-    )
-    if error_code != accessibility.kAXErrorSuccess or value is None:
-        raise TextInsertionError(f"Could not capture {description}.")
-    return value
-
-
-def _describe_ax_element(accessibility, element) -> str:
-    details = []
-    attributes = (
-        ("role", "kAXRoleAttribute"),
-        ("subrole", "kAXSubroleAttribute"),
-        ("title", "kAXTitleAttribute"),
-        ("description", "kAXDescriptionAttribute"),
-    )
-    for label, constant_name in attributes:
-        attribute = getattr(accessibility, constant_name, None)
-        if attribute is None:
-            continue
-        error_code, value = accessibility.AXUIElementCopyAttributeValue(
-            element, attribute, None
-        )
-        if error_code == accessibility.kAXErrorSuccess and value:
-            details.append(f"{label}={value!s}")
-
-    return ", ".join(details) or repr(element)
-
-
-def insert_text(text: str, target: TargetApplication) -> None:
-    """Paste Unicode text into the focused field of the captured application."""
+def insert_text(text: str, target: TargetContext) -> None:
+    """Paste into the current cursor after verifying application/window context."""
     if not text.strip():
         return
 
     try:
         from AppKit import (
-            NSApplicationActivateIgnoringOtherApps,
             NSPasteboard,
             NSPasteboardItem,
             NSPasteboardTypeString,
-            NSRunningApplication,
+            NSWorkspace,
         )
         from Foundation import NSData
         from CoreFoundation import CFEqual
@@ -161,12 +253,6 @@ def insert_text(text: str, target: TargetApplication) -> None:
         raise TextInsertionError(
             "The macOS text-insertion dependencies are not installed."
         ) from error
-
-    application = NSRunningApplication.runningApplicationWithProcessIdentifier_(
-        target.process_id
-    )
-    if application is None:
-        raise TextInsertionError(f"{target.name} is no longer running.")
 
     pasteboard = NSPasteboard.generalPasteboard()
     snapshot = _snapshot_pasteboard(pasteboard)
@@ -179,21 +265,13 @@ def insert_text(text: str, target: TargetApplication) -> None:
             raise TextInsertionError("Could not place translated text on the clipboard.")
         owned_change_count = pasteboard.changeCount()
 
-        application.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
-        time.sleep(APP_ACTIVATION_DELAY_SECONDS)
-
-        error_code = accessibility.AXUIElementSetAttributeValue(
-            target.focused_element, accessibility.kAXFocusedAttribute, True
+        _verify_target_context(
+            accessibility,
+            CFEqual,
+            target,
+            workspace=NSWorkspace.sharedWorkspace(),
         )
-        if error_code != accessibility.kAXErrorSuccess:
-            raise TextInsertionError(
-                f"Could not restore focus to the captured field in {target.name}."
-            )
-
-        _verify_target_focus(accessibility, CFEqual, target)
-
         _post_paste_shortcut(Quartz)
-
         time.sleep(PASTE_COMPLETION_DELAY_SECONDS)
     except TextInsertionError:
         raise
@@ -210,6 +288,34 @@ def insert_text(text: str, target: TargetApplication) -> None:
                 NSPasteboardItem,
                 NSData,
             )
+
+
+def _verify_target_context(
+    accessibility, elements_equal, target: TargetContext, *, workspace
+) -> None:
+    """Require the captured application and optional window to remain current."""
+    current_application = workspace.frontmostApplication()
+    if current_application is None:
+        raise TextInsertionError("Could not verify the frontmost application.")
+    current_process_id = int(current_application.processIdentifier())
+    if current_process_id != target.process_id:
+        raise TextInsertionError(
+            f"The frontmost application is no longer {target.name}; paste was cancelled."
+        )
+
+    _verify_optional_systemwide_pid(accessibility, target.process_id)
+    if target.window_element is None:
+        return
+
+    current_window = _optional_focused_window(accessibility, target.process_id)
+    if current_window is None:
+        raise TextInsertionError(
+            f"Could not verify the captured window in {target.name}; paste was cancelled."
+        )
+    if not elements_equal(current_window, target.window_element):
+        raise TextInsertionError(
+            f"A different window is active in {target.name}; paste was cancelled."
+        )
 
 
 def _post_paste_shortcut(quartz) -> None:
@@ -248,41 +354,8 @@ def _post_paste_shortcut(quartz) -> None:
             quartz.CGEventPost(quartz.kCGHIDEventTap, command_up)
 
 
-def _verify_target_focus(accessibility, elements_equal, target) -> None:
-    """Refuse to paste unless the original app and element have focus."""
-    system_wide = accessibility.AXUIElementCreateSystemWide()
-    application_element = _required_ax_attribute(
-        accessibility,
-        system_wide,
-        accessibility.kAXFocusedApplicationAttribute,
-        "the restored focused application",
-    )
-    error_code, process_id = accessibility.AXUIElementGetPid(
-        application_element, None
-    )
-    if (
-        error_code != accessibility.kAXErrorSuccess
-        or int(process_id) != target.process_id
-    ):
-        raise TextInsertionError(
-            f"Focus did not return to the captured application {target.name}."
-        )
-
-    focused_element = _required_ax_attribute(
-        accessibility,
-        application_element,
-        accessibility.kAXFocusedUIElementAttribute,
-        "the restored focused element",
-    )
-    if not elements_equal(focused_element, target.focused_element):
-        raise TextInsertionError(
-            f"Focus did not return to the captured field in {target.name}."
-        )
-
-
 def _snapshot_pasteboard(pasteboard) -> tuple[PasteboardItemSnapshot, ...]:
     snapshots: list[PasteboardItemSnapshot] = []
-
     for item in pasteboard.pasteboardItems() or []:
         values: list[tuple[str, bytes]] = []
         for type_name in item.types() or []:
@@ -290,7 +363,6 @@ def _snapshot_pasteboard(pasteboard) -> tuple[PasteboardItemSnapshot, ...]:
             if data is not None:
                 values.append((str(type_name), bytes(data)))
         snapshots.append(PasteboardItemSnapshot(tuple(values)))
-
     return tuple(snapshots)
 
 
@@ -301,7 +373,6 @@ def _restore_pasteboard(
     data_class,
 ) -> None:
     pasteboard.clearContents()
-
     restored_items = []
     for saved_item in snapshot:
         item = pasteboard_item_class.alloc().init()
@@ -309,7 +380,6 @@ def _restore_pasteboard(
             data = data_class.dataWithBytes_length_(raw_data, len(raw_data))
             item.setData_forType_(data, type_name)
         restored_items.append(item)
-
     if restored_items:
         pasteboard.writeObjects_(restored_items)
 
@@ -324,7 +394,6 @@ def _restore_pasteboard_if_owned(
     """Restore a snapshot only while Dicta's pasteboard contents are current."""
     if pasteboard.changeCount() != owned_change_count:
         return False
-
     _restore_pasteboard(
         pasteboard, snapshot, pasteboard_item_class, data_class
     )

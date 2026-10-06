@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from voice_translator.menu_bar import MenuBarController
+from voice_translator.service import ServiceState
 
 
 class CapturedThread:
@@ -42,6 +43,48 @@ class MenuBarShutdownTests(unittest.TestCase):
         self.controller.handle_sigint(signal.SIGINT)
 
         self.controller.request_shutdown.assert_called_once_with()
+
+
+class MenuBarHUDTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.service = Mock()
+        self.hotkey = Mock()
+        self.hud = Mock()
+        self.controller = MenuBarController.alloc().init()
+        self.controller.configure(self.service, self.hotkey, self.hud)
+
+    def test_service_states_map_to_hud_messages(self) -> None:
+        self.controller._apply_state(ServiceState.RECORDING)
+        self.controller._apply_state(ServiceState.PROCESSING)
+        self.controller._apply_state(ServiceState.DONE)
+        self.controller._apply_state(ServiceState.READY)
+
+        self.hud.show_recording.assert_called_once_with()
+        self.hud.show_translating.assert_called_once_with()
+        self.hud.show_done.assert_called_once_with()
+        self.hud.hide.assert_not_called()
+
+    def test_failure_requests_error_then_idle_preserves_transient(self) -> None:
+        self.controller._apply_state(ServiceState.ERROR)
+        self.controller._apply_state(ServiceState.READY)
+
+        self.hud.show_error.assert_called_once_with()
+        self.hud.hide.assert_not_called()
+
+        self.controller._apply_state(ServiceState.STARTING)
+        self.hud.hide.assert_called_once_with()
+
+    def test_idle_without_completion_hides_hud(self) -> None:
+        self.controller._apply_state(ServiceState.READY)
+
+        self.hud.hide.assert_called_once_with()
+
+    def test_hud_failure_does_not_escape_state_update(self) -> None:
+        self.hud.show_recording.side_effect = RuntimeError("broken HUD")
+
+        self.controller._apply_state(ServiceState.RECORDING)
+
+        self.hud.show_recording.assert_called_once_with()
 
 
 if __name__ == "__main__":

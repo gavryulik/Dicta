@@ -3,7 +3,8 @@ import threading
 from unittest.mock import Mock, patch
 
 from voice_translator.service import ServiceState, VoiceTranslatorService
-from voice_translator.text_insertion import TargetApplication
+from voice_translator.text_insertion import TargetContext
+from voice_translator.whisper import WhisperError
 
 
 class ImmediateThread:
@@ -26,11 +27,7 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
     def test_successful_session_translates_inserts_and_becomes_ready(self) -> None:
         recorder = Mock()
         recorder.is_recording = False
-        target = TargetApplication(
-            process_id=123,
-            name="Example",
-            focused_element=object(),
-        )
+        target = TargetContext(process_id=123, name="Example")
 
         with (
             patch(
@@ -38,7 +35,7 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
                 return_value=recorder,
             ),
             patch(
-                "voice_translator.service.capture_target_application",
+                "voice_translator.service.capture_target_context",
                 return_value=target,
             ),
             patch(
@@ -61,11 +58,7 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
     def test_successful_session_reports_state_changes(self) -> None:
         recorder = Mock()
         recorder.is_recording = False
-        target = TargetApplication(
-            process_id=123,
-            name="Example",
-            focused_element=object(),
-        )
+        target = TargetContext(process_id=123, name="Example")
         states = []
 
         with (
@@ -74,7 +67,7 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
                 return_value=recorder,
             ),
             patch(
-                "voice_translator.service.capture_target_application",
+                "voice_translator.service.capture_target_context",
                 return_value=target,
             ),
             patch(
@@ -94,6 +87,43 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
                 ServiceState.STARTING,
                 ServiceState.RECORDING,
                 ServiceState.PROCESSING,
+                ServiceState.DONE,
+                ServiceState.READY,
+            ],
+        )
+
+    def test_failed_translation_reports_error_then_becomes_ready(self) -> None:
+        recorder = Mock()
+        recorder.is_recording = False
+        target = TargetContext(process_id=123, name="Example")
+        states = []
+
+        with (
+            patch(
+                "voice_translator.service.MicrophoneRecorder",
+                return_value=recorder,
+            ),
+            patch(
+                "voice_translator.service.capture_target_context",
+                return_value=target,
+            ),
+            patch(
+                "voice_translator.service.translate_audio",
+                side_effect=WhisperError("translation failed"),
+            ),
+            patch("voice_translator.service.threading.Thread", ImmediateThread),
+        ):
+            service = VoiceTranslatorService(on_state_change=states.append)
+            service.start_recording()
+            service.stop_recording()
+
+        self.assertEqual(
+            states,
+            [
+                ServiceState.STARTING,
+                ServiceState.RECORDING,
+                ServiceState.PROCESSING,
+                ServiceState.ERROR,
                 ServiceState.READY,
             ],
         )
@@ -127,11 +157,7 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
     def test_session_uses_injected_text_inserter(self) -> None:
         recorder = Mock()
         recorder.is_recording = False
-        target = TargetApplication(
-            process_id=123,
-            name="Example",
-            focused_element=object(),
-        )
+        target = TargetContext(process_id=123, name="Example")
         text_inserter = Mock()
 
         with (
@@ -140,7 +166,7 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
                 return_value=recorder,
             ),
             patch(
-                "voice_translator.service.capture_target_application",
+                "voice_translator.service.capture_target_context",
                 return_value=target,
             ),
             patch(
@@ -158,11 +184,7 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
     def test_session_uses_injected_target_capturer(self) -> None:
         recorder = Mock()
         recorder.is_recording = False
-        target = TargetApplication(
-            process_id=123,
-            name="Example",
-            focused_element=object(),
-        )
+        target = TargetContext(process_id=123, name="Example")
         target_capturer = Mock(return_value=target)
 
         with (
@@ -171,11 +193,12 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
                 return_value=recorder,
             ),
             patch(
-                "voice_translator.service.capture_target_application"
+                "voice_translator.service.capture_target_context"
             ) as default_capturer,
         ):
             service = VoiceTranslatorService(target_capturer=target_capturer)
             service.start_recording()
+            service._start_worker.join(timeout=1.0)
 
         target_capturer.assert_called_once_with()
         default_capturer.assert_not_called()
@@ -190,11 +213,7 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
         recorder.is_recording = True
         temporary_directory = Mock()
         temporary_directory.name = "/tmp/voice-translator-test"
-        target = TargetApplication(
-            process_id=123,
-            name="Example",
-            focused_element=object(),
-        )
+        target = TargetContext(process_id=123, name="Example")
 
         def blocking_stop(audio_path) -> None:
             del audio_path
@@ -228,6 +247,7 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
                 target_capturer=Mock(return_value=target),
             )
             service.start_recording()
+            service._start_worker.join(timeout=1.0)
 
             stop_thread = threading.Thread(target=service.stop_recording)
             shutdown_thread = threading.Thread(target=service.shutdown)
@@ -249,6 +269,83 @@ class VoiceTranslatorServiceTests(unittest.TestCase):
         recorder.stop.assert_called_once()
         recorder.cancel.assert_not_called()
         temporary_directory.cleanup.assert_called_once_with()
+
+    def test_release_during_slow_target_capture_is_preserved(self) -> None:
+        capture_started = threading.Event()
+        allow_capture = threading.Event()
+        session_finished = threading.Event()
+        recorder = Mock()
+        recorder.is_recording = False
+        target = TargetContext(process_id=123, name="Example")
+
+        def capture_target():
+            capture_started.set()
+            allow_capture.wait(timeout=1.0)
+            return target
+
+        def state_changed(state) -> None:
+            if state is ServiceState.READY:
+                session_finished.set()
+
+        with (
+            patch(
+                "voice_translator.service.MicrophoneRecorder",
+                return_value=recorder,
+            ),
+            patch(
+                "voice_translator.service.translate_audio",
+                return_value="Translated text",
+            ),
+        ):
+            service = VoiceTranslatorService(
+                on_state_change=state_changed,
+                text_inserter=Mock(),
+                target_capturer=capture_target,
+            )
+            service.start_recording()
+            self.assertTrue(capture_started.wait(timeout=1.0))
+
+            service.stop_recording()
+            allow_capture.set()
+
+            self.assertTrue(session_finished.wait(timeout=1.0))
+
+        recorder.start.assert_called_once_with()
+        recorder.stop.assert_called_once()
+        self.assertIs(service.state, ServiceState.READY)
+
+    def test_repeated_start_during_capture_does_not_duplicate_session(self):
+        capture_started = threading.Event()
+        allow_capture = threading.Event()
+        target_capturer = Mock()
+        target = TargetContext(process_id=123, name="Example")
+
+        def capture_target():
+            capture_started.set()
+            allow_capture.wait(timeout=1.0)
+            return target
+
+        target_capturer.side_effect = capture_target
+        recorder = Mock()
+        recorder.is_recording = False
+
+        with patch(
+            "voice_translator.service.MicrophoneRecorder",
+            return_value=recorder,
+        ) as recorder_class:
+            service = VoiceTranslatorService(target_capturer=target_capturer)
+            service.start_recording()
+            self.assertTrue(capture_started.wait(timeout=1.0))
+
+            service.start_recording()
+            allow_capture.set()
+            service._start_worker.join(timeout=1.0)
+
+        target_capturer.assert_called_once_with()
+        recorder_class.assert_called_once_with()
+        recorder.start.assert_called_once_with()
+        self.assertIs(service.state, ServiceState.RECORDING)
+        service.shutdown()
 
 
 if __name__ == "__main__":

@@ -8,8 +8,8 @@
 
 Dicta is a focused macOS menu bar utility that turns spoken Russian into
 English text. Hold **Option+Space**, speak, and release — Dicta
-translates your speech locally and inserts the result into the text field you
-were using.
+translates your speech locally and inserts the result at the current cursor
+position. Remain in the same application/window until insertion is complete.
 
 ## Screenshot
 
@@ -17,7 +17,7 @@ were using.
 
 ## Demo
 
-Hold **Option+Space**, speak in Russian, then release. Dicta translates your speech locally and inserts the English text into the active text field.
+Hold **Option+Space**, speak in Russian, then release. Dicta translates your speech locally and inserts the English text at the current cursor position.
 
 ![Dicta demo](assets/dicta-demo.gif)
 
@@ -29,22 +29,25 @@ other text without switching away from the application currently in use.
 It is written primarily in Python and uses PyObjC for its native-feeling macOS
 menu bar and system integration.
 
-When dictation begins, Dicta remembers the focused application and text field.
-After recording stops, it translates the speech with a local Whisper model,
-returns focus to the original field, and inserts the English text. It does not
-press Enter or Return.
+When dictation begins, Dicta remembers which application it started in. After
+recording stops, it translates the speech with a local Whisper model and
+verifies that you are still in the expected application/window before
+inserting the English text at the current cursor position. Dicta does not
+automatically switch applications or restore an earlier text field. It does
+not press Enter or Return.
 
 Dicta runs in the macOS menu bar without a normal Dock window. It is intended
-to work with browsers, ChatGPT, editors, terminals, Notes, messengers, email
-clients, and other standard macOS text fields, subject to each application's
-Accessibility behavior.
+to work with many standard editable areas in browsers, ChatGPT, editors,
+terminals, Notes, messengers, email clients, and other macOS applications,
+subject to each application's Accessibility behavior.
 
 ## Features
 
 - Local Russian speech recognition and Russian-to-English translation.
 - Global **Option+Space** push-to-talk shortcut.
-- Inserts text into the field that was focused when recording started.
-- Verifies the original application and field before pasting.
+- Inserts translated text at the current cursor position.
+- Verifies the expected application/window before insertion and may safely
+  refuse insertion if the user has switched to another application or window.
 - Preserves the existing clipboard when Dicta still owns the temporary
   clipboard contents; it also avoids overwriting a newer clipboard change.
 - Menu bar statuses: **Ready**, **Recording**, **Translating**, and
@@ -93,20 +96,13 @@ Use macOS's per-app approval workflow:
 Only approve a copy obtained from this repository's official Releases section.
 There is no need to disable Gatekeeper or change macOS security globally.
 
-### First startup
-
-The first launch of Dicta may take longer than usual while the local Whisper model is initialized. Please allow some time for Dicta to appear in the menu bar and become ready.
-
-Subsequent launches are typically faster.
-
-
 ## Permissions
 
 Dicta needs three macOS permissions:
 
 - **Microphone** — records your voice from the Mac's selected input device.
-- **Accessibility** — remembers and restores the original application and text
-  field, then sends the paste command that inserts the translation.
+- **Accessibility** — helps Dicta verify the target window when available and
+  send the paste command.
 - **Input Monitoring** — detects the global **Option+Space** shortcut while
   another application is active.
 
@@ -124,12 +120,17 @@ that launches Dicta rather than to a packaged `Dicta.app`.
 ## How to Use
 
 1. Launch Dicta and confirm that its waveform icon appears in the menu bar.
-2. Focus the text field where the English text should be inserted.
+2. Place the cursor where you want the English text to be inserted.
 3. Hold **Option+Space**.
 4. Speak in Russian.
 5. Release **Option+Space** to stop recording.
 6. Wait while the menu status shows **Translating**.
-7. The English translation appears in the original text field.
+7. Dicta translates your speech locally, and the English translation appears
+   at the current cursor position.
+
+Remain in the same application/window during the operation. If you switch to
+another application or window, Dicta may safely refuse insertion rather than
+switching back.
 
 Dicta never sends Enter or Return automatically. Review or edit the inserted
 text, then submit it yourself when ready.
@@ -158,15 +159,18 @@ The runtime pipeline is deliberately small:
 Microphone
     → temporary 16 kHz mono WAV
     → local whisper.cpp Russian-to-English translation
-    → restore and verify the original Accessibility element
-    → temporary clipboard text + physical Command+V events
-    → restore the previous clipboard contents
+    → verify the expected application and optional reliable window context
+    → temporary clipboard text + physical Command+V at the current cursor
+    → restore the previous clipboard contents if Dicta still owns them
 ```
 
-Dicta captures the focused application and macOS Accessibility element before
-recording. Before insertion, it reactivates that application, restores focus,
-and verifies that the same field is focused. It then uses a clipboard-assisted
-paste and restores the clipboard if no newer clipboard change has occurred.
+Dicta captures the frontmost application and, when reliable information is
+available, its window context before recording. Before insertion, it verifies
+that the expected application and optional window are still active. It does
+not reactivate applications or restore an earlier text field. Dicta temporarily
+places the translation on the clipboard, sends physical Command+V at the
+current cursor position, and restores the previous clipboard contents only if
+no newer clipboard change has occurred.
 
 ## For Developers
 
@@ -317,5 +321,5 @@ Bundled third-party components remain subject to their respective licenses.
   because public builds are not Developer ID signed or Apple-notarized.
 - Recognition and translation accuracy depend on microphone quality,
   background noise, pronunciation, and the Whisper model.
-- Text insertion depends on the target application's macOS Accessibility
-  behavior; some protected or nonstandard fields may reject automated paste.
+- Text insertion works with many standard editable areas on macOS, but some
+  protected or nonstandard fields may reject automated paste.

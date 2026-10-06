@@ -5,9 +5,10 @@ import threading
 
 from voice_translator.config import PRODUCT_NAME, PUSH_TO_TALK_LABEL
 from voice_translator.hotkey import GlobalPushToTalkHotkey, HotkeyError
+from voice_translator.hud import StatusHUD
 from voice_translator.permissions import PermissionSetupError, require_macos_permissions
 from voice_translator.service import ServiceState, VoiceTranslatorService
-from voice_translator.text_insertion import capture_target_application, insert_text
+from voice_translator.text_insertion import capture_target_context, insert_text
 
 
 def main() -> int:
@@ -32,6 +33,11 @@ def main() -> int:
     application.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
     controller = MenuBarController.alloc().init()
+    try:
+        hud = StatusHUD.alloc().init()
+    except Exception as error:
+        print(f"HUD initialization error: {error}", flush=True)
+        hud = None
     service = VoiceTranslatorService(
         text_inserter=controller.insert_text_on_main_thread,
         target_capturer=controller.capture_target_on_main_thread,
@@ -40,7 +46,7 @@ def main() -> int:
         on_start=service.start_recording,
         on_stop=service.stop_recording,
     )
-    controller.configure(service, hotkey)
+    controller.configure(service, hotkey, hud)
     service.set_state_callback(controller.service_state_changed)
     MachSignals.signal(signal.SIGINT, controller.handle_sigint)
 
@@ -93,12 +99,14 @@ class MenuBarController(NSObject):
     """Own the status item and translate service state into menu updates."""
 
     @objc.python_method
-    def configure(self, service, hotkey) -> None:
+    def configure(self, service, hotkey, hud=None) -> None:
         self._service = service
         self._hotkey = hotkey
         self._status_item = None
         self._status_menu_item = None
         self._toggle_menu_item = None
+        self._hud = hud
+        self._hud_transient_visible = False
         self._did_shutdown = False
         self._shutdown_thread = None
 
@@ -170,8 +178,8 @@ class MenuBarController(NSObject):
 
     @objc.python_method
     def capture_target_on_main_thread(self):
-        """Capture the focused target without using AppKit off the main thread."""
-        return self._run_on_main_thread(capture_target_application)
+        """Capture the frontmost app context on AppKit's main thread."""
+        return self._run_on_main_thread(capture_target_context)
 
     @staticmethod
     @objc.python_method
@@ -187,6 +195,7 @@ class MenuBarController(NSObject):
         self._apply_state(ServiceState[str(state_name)])
 
     def _apply_state(self, state: ServiceState) -> None:
+        self._apply_hud_state(state)
         if self._status_menu_item is None:
             return
 
@@ -196,6 +205,8 @@ class MenuBarController(NSObject):
             ServiceState.STARTING: "Ready",
             ServiceState.RECORDING: "Recording",
             ServiceState.PROCESSING: "Translating",
+            ServiceState.DONE: "Ready",
+            ServiceState.ERROR: "Ready",
             ServiceState.STOPPING: "Translating",
         }
         self._status_menu_item.setTitle_(f"Status: {labels[state]}")
@@ -205,6 +216,34 @@ class MenuBarController(NSObject):
             else "Enable Dictation"
         )
         self._toggle_menu_item.setTitle_(toggle_title)
+
+    @objc.python_method
+    def _apply_hud_state(self, state: ServiceState) -> None:
+        if self._hud is None:
+            return
+
+        try:
+            if state is ServiceState.RECORDING:
+                self._hud_transient_visible = False
+                self._hud.show_recording()
+            elif state is ServiceState.PROCESSING:
+                self._hud_transient_visible = False
+                self._hud.show_translating()
+            elif state is ServiceState.DONE:
+                self._hud.show_done()
+                self._hud_transient_visible = True
+            elif state is ServiceState.ERROR:
+                self._hud.show_error()
+                self._hud_transient_visible = True
+            elif self._hud_transient_visible:
+                # DONE/ERROR own a short timer. The immediately following idle
+                # state must not hide the completion message prematurely.
+                self._hud_transient_visible = False
+            else:
+                self._hud.hide()
+        except Exception as error:
+            self._hud_transient_visible = False
+            print(f"HUD update error: {error}", flush=True)
 
     def toggleDictation_(self, sender) -> None:
         del sender
