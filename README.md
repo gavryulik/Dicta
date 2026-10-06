@@ -80,21 +80,21 @@ runtime dependencies.
 Dicta appears in the menu bar. It does not open a normal application window or
 add a regular Dock window.
 
-## First Launch and Gatekeeper
+### First launch
 
-Dicta is currently ad-hoc signed and is not notarized by Apple. Because macOS
-cannot verify an identified developer for this build, Gatekeeper may block the
-first launch.
+Dicta is currently distributed without Apple notarization. macOS may block the first launch.
 
-Use macOS's per-app approval workflow:
+If this happens:
 
-1. Try to open Dicta once from the Applications folder.
+1. Try to open Dicta once.
 2. Open **System Settings → Privacy & Security**.
-3. Scroll to the security message about Dicta and click **Open Anyway**.
-4. Confirm by clicking **Open**.
+3. Find the message about Dicta and click **Open Anyway**.
 
-Only approve a copy obtained from this repository's official Releases section.
-There is no need to disable Gatekeeper or change macOS security globally.
+![Open Anyway in macOS Privacy & Security](assets/dicta-open-anyway.png)
+
+4. Confirm **Open**.
+
+Do not disable Gatekeeper globally.
 
 ## Permissions
 
