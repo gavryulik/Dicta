@@ -1,5 +1,6 @@
 """Native macOS menu bar entry point for Dicta."""
 
+from collections import deque
 import signal
 import threading
 
@@ -9,6 +10,10 @@ from voice_translator.hud import StatusHUD
 from voice_translator.permissions import PermissionSetupError, require_macos_permissions
 from voice_translator.service import ServiceState, VoiceTranslatorService
 from voice_translator.text_insertion import capture_target_context, insert_text
+
+
+RECENT_TRANSLATION_LIMIT = 5
+TRANSLATION_PREVIEW_LENGTH = 60
 
 
 def main() -> int:
@@ -76,9 +81,12 @@ try:
     import objc
     from AppKit import (
         NSApplication,
+        NSBeep,
         NSImage,
         NSMenu,
         NSMenuItem,
+        NSPasteboard,
+        NSPasteboardTypeString,
         NSStatusBar,
         NSVariableStatusItemLength,
     )
@@ -105,6 +113,8 @@ class MenuBarController(NSObject):
         self._status_item = None
         self._status_menu_item = None
         self._toggle_menu_item = None
+        self._recent_translations = deque(maxlen=RECENT_TRANSLATION_LIMIT)
+        self._history_menu = None
         self._hud = hud
         self._hud_transient_visible = False
         self._did_shutdown = False
@@ -142,6 +152,15 @@ class MenuBarController(NSObject):
         self._toggle_menu_item.setTarget_(self)
         menu.addItem_(self._toggle_menu_item)
 
+        history_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Recent Translations", None, ""
+        )
+        self._history_menu = NSMenu.alloc().initWithTitle_("Recent Translations")
+        self._history_menu.setAutoenablesItems_(False)
+        history_item.setSubmenu_(self._history_menu)
+        menu.addItem_(history_item)
+        self._refresh_history_menu()
+
         menu.addItem_(self._disabled_item(f"Shortcut: {PUSH_TO_TALK_LABEL}"))
         menu.addItem_(NSMenuItem.separatorItem())
 
@@ -173,8 +192,57 @@ class MenuBarController(NSObject):
     def insert_text_on_main_thread(
         self, text: str, target
     ) -> None:
-        """Run the existing AppKit-based insertion on AppKit's main thread."""
-        self._run_on_main_thread(insert_text, text, target)
+        """Retain the translation before attempting insertion on the main thread."""
+        self._run_on_main_thread(self._remember_and_insert, text, target)
+
+    @objc.python_method
+    def _remember_and_insert(self, text, target) -> None:
+        if text.strip():
+            self._recent_translations.appendleft(text)
+            self._refresh_history_menu()
+        insert_text(text, target)
+
+    @objc.python_method
+    def _refresh_history_menu(self) -> None:
+        if self._history_menu is None:
+            return
+        self._history_menu.removeAllItems()
+        if not self._recent_translations:
+            self._history_menu.addItem_(self._disabled_item("No recent translations"))
+            return
+
+        for text in self._recent_translations:
+            preview = " ".join(text.split())
+            if len(preview) > TRANSLATION_PREVIEW_LENGTH:
+                preview = preview[: TRANSLATION_PREVIEW_LENGTH - 1] + "…"
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"Copy: {preview}", "copyRecentTranslation:", ""
+            )
+            item.setTarget_(self)
+            # Bind the displayed result itself, not an index that can change.
+            item.setRepresentedObject_(text)
+            self._history_menu.addItem_(item)
+
+        self._history_menu.addItem_(NSMenuItem.separatorItem())
+        clear_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Clear History", "clearRecentTranslations:", ""
+        )
+        clear_item.setTarget_(self)
+        self._history_menu.addItem_(clear_item)
+
+    def copyRecentTranslation_(self, sender) -> None:
+        text = sender.representedObject()
+        if text is None:
+            return
+        pasteboard = NSPasteboard.generalPasteboard()
+        pasteboard.clearContents()
+        if not pasteboard.setString_forType_(text, NSPasteboardTypeString):
+            NSBeep()
+
+    def clearRecentTranslations_(self, sender) -> None:
+        del sender
+        self._recent_translations.clear()
+        self._refresh_history_menu()
 
     @objc.python_method
     def capture_target_on_main_thread(self):

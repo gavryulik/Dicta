@@ -53,6 +53,8 @@ subject to each application's Accessibility behavior.
 - Menu bar statuses: **Ready**, **Recording**, **Translating**, and
   **Disabled**.
 - Menu controls to enable or disable dictation, display the shortcut, and quit.
+- Recent Translations submenu to copy any of the last five completed translations,
+  including results whose insertion was cancelled.
 - No cloud speech or translation API, API key, account, or subscription.
 - Standalone Apple Silicon application with whisper.cpp and the model bundled.
 
@@ -139,6 +141,14 @@ The menu bar menu shows the current status and shortcut. Use **Disable
 Dictation** to temporarily ignore the shortcut, **Enable Dictation** to resume,
 or **Quit Dicta** to close the application.
 
+Open **Recent Translations** to recover a result or copy it again. The submenu
+shows the last five completed translations, newest first. Click a **Copy:**
+entry to place its full text on the clipboard, then paste it where you want.
+Long entries have shortened previews; copying preserves the complete text and
+line breaks. Results are retained even when Dicta refuses automatic insertion
+because the target application or window changed. Use **Clear History** to
+remove all entries.
+
 ## Privacy
 
 Speech processing happens locally on your Mac. Dicta records audio into a
@@ -150,6 +160,11 @@ API key, a user account, or a subscription. The application does not
 intentionally upload dictated audio or translated text to a remote service.
 Temporary recording data is cleaned up after the dictation session during
 normal operation.
+
+Recent translations are kept only in memory for the current app session and
+are not written to disk. They are removed when you clear the history or quit
+Dicta. Explicitly copying a history entry leaves that text on your clipboard;
+clearing history does not clear the system clipboard.
 
 ## How It Works
 
